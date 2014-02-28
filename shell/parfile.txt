@@ -1,0 +1,9 @@
+1 2 3 
+str1 str2 3
+"space str" ee t 5
+"space dq" 3
+'space sq' 3
+space\ sp 3
+\"space backs\" 3
+'space sq' 3
+er 1 2 3

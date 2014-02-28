@@ -1,0 +1,8 @@
+####files containing a key for changes in SampleID names (the columns could be easily swapped of course)
+ID  key
+957 12.C1
+7310 12.C2
+6904 12.C3
+8231 12.C4
+9057 12.C5
+7372 12.C6

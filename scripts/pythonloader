@@ -1,0 +1,85 @@
+#!/bin/sh
+# pythonloader - 10/5/2011 - Marco Mambelli marco@hep.uchicago.edu
+# This is a minimally intrusive python loader
+# It looks in the PATH for a python (python or python26 executables) that is at least version MIN_VERSION
+# If it is not found, then the first python in the PATH is used unless the STRICT setting is enabled (see below)
+# Then it is replacing itself (exec) with the found executable
+#
+###### To use this ########
+# Change MIN_VERSION to change the min version desired.
+# Add a link to loadpython.sh to the PATH as python so that it is found before all the other in the paths, e.g.:
+# ln -s ~/bin/loadpython.sh ~/bin/python
+# export PATH=~/bin:$PATH
+#
+# Version number {major}{minor} e.g. for python 2.6 use 26
+MIN_VERSION=25
+# to allow the execution even if only lower versions of python are found, then set strict to "no"
+# Setting STRICT="yes" or the environment variable PYTHONLOADER_STRICT="yes" causes the program to 
+# exit with a warning and exit code 1 if no python of high enough version is found
+STRICT="no"
+#STRICT="yes"
+
+PROGNAME=$0
+
+# verify if strict
+if [ "X${PYTHONLOADER_STRICT}X" = "XnoX" -o "X${PYTHONLOADER_STRICT}X" = "XnX" ]; then
+ STRICT="no"
+fi
+if [ "X${PYTHONLOADER_STRICT}X" = "XyesX" -o "X${PYTHONLOADER_STRICT}X" = "XyX" ]; then
+ STRICT="yes"
+fi
+
+function is_link_to_me () {
+ if [ "$1" = "$PROGNAME" ]; then
+  return 0
+ fi
+ fname=$1 
+ while [ -L "$fname" ]; do
+  fname="$(readlink "$fname")"
+ done
+ if [ "`basename \"$fname\"`" = "pythonloader" ]; then 
+  return 0
+ fi
+ return 1
+}
+
+#me=`basename $0`
+#me="$(basename "$(test -L "$0" && readlink "$0" || echo "$0")")"
+
+which python python26 > /dev/null 2>&1;
+if [ $? -eq 2 ] ; then
+  echo "Python interpreter (python or python26) not in the path"
+  exit 1
+fi
+
+backupexe=""
+if [ "$STRICT" = "no" ]; then
+ backupexe="REPLACE"
+fi
+found="NOT_FOUND"
+for i in `which -a python python26 2> /dev/null`; do
+ if is_link_to_me $i; then
+  continue
+ fi
+ if [ "$backupexe" = "REPLACE" ]; then
+   backupexe=$i
+ fi
+ versnum=$((`$i -c "import sys; print '%s%s' % (sys.version_info[0], sys.version_info[1])"`))
+ if [ $versnum -ge 25 ]; then
+  found=$i
+  break
+ fi
+done
+
+if [ "$found" = "NOT_FOUND" ]; then
+ if [ "$STRICT" = "no" ]; then
+  exec $backupexe "$@"
+ fi
+ echo "LOADPYTHON_STRICT has been set and no available python satisfy the min version requirement (${MIN_VERSION}). Aborting."
+ exit 1
+fi
+
+#exec $found $*
+exec $found "$@"
+
+

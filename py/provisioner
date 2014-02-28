@@ -1,0 +1,348 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import pwd
+import shutil
+import urllib2
+import StringIO
+import gzip
+import tarfile
+import zipfile
+
+blacklist = {
+    'rhost': ''.split(),
+    'ruser': ''.split(),
+    'service': 'crond'.split(),
+    'tty': ''.split(),
+    'type': ''.split(),
+    'user': ''.split(),
+}
+
+class PAM(object):
+    tag = 'provisioner'
+    debug = False
+
+    def __init__(self, **kwargs):
+        # default init parameters
+        self.user = ''
+        self.type = ''
+        self.pw_uid = 99
+        self.pw_gid = 99
+        self.pw_dir = ''
+        # init with record
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+    def log(self, msg, **kwargs):
+        d = dict(self.__dict__)
+        d.update(kwargs)
+        print >>sys.stderr, self.tag + ': ' + (msg % d)
+
+    def chown(self, *args):
+        '''pam.chown(optional_path, ...)'''
+        if len(args) == 0:
+            args = (self.pw_dir,)
+
+        for path in args:
+            for base, dirs, files in os.walk(path):
+                for f in files:
+                    os.lchown(os.path.join(base, f), self.pw_uid, self.pw_gid)
+
+    def copytree(self, src, dst):
+        '''shutil.copytree() does not permit dst to exist, so here's a
+        replacement.'''
+
+        entries = os.listdir(src)
+        desc = "perform any copy/link"
+        for ent in entries:
+            oldpath = os.path.join(src, ent)
+            newpath = os.path.join(dst, ent)
+            s = os.stat(oldpath)
+
+            try:
+                if os.path.isdir(oldpath):
+                    os.mkdir(newpath)
+                    self.copytree(oldpath, newpath)
+                    os.lchown(newpath, self.pw_uid, self.pw_gid)
+                    os.chmod(newpath, s.st_mode)
+                    os.utime(newpath, (s.st_atime, s.st_mtime))
+                    desc = 'copytree %s' % newpath
+                elif os.path.islink(oldpath):
+                    link = os.readlink(oldpath)
+                    os.symlink(link, newpath)
+                    os.lchown(newpath, self.pw_uid, self.pw_gid)
+                    desc = 'link %s %s' % (link, newpath)
+                elif os.path.isfile(oldpath):
+                    shutil.copyfile(oldpath, newpath)
+                    os.lchown(newpath, self.pw_uid, self.pw_gid)
+                    os.chmod(newpath, s.st_mode)
+                    os.utime(newpath, (s.st_atime, s.st_mtime))
+                    desc = 'copy %s %s' % (oldpath, newpath)
+            except OSError, e:
+                self.log('cannot ' + desc + ': %(error)s', error=str(e))
+
+    def dropprivs(self):
+        os.setregid(self.pw_gid, self.pw_gid)
+        os.setreuid(self.pw_uid, self.pw_uid)
+
+
+class Provisioner(object):
+    '''template provisioner
+    This provisioner never succeeds; it is a superclass for automatically
+    discovering all available provisioners.
+
+    To implement a provisioner, subclass Provisioner.  Override its priority
+    if you have preferences about the order that provisioners are tried in;
+    higher-priority provisioners are used first.  Default priority is 0.
+    Negative priorities are fair.
+
+    The first line of the provisioner's docstring is used as a description,
+    so use a docstring, please.
+
+    A provisioner may drop privileges, but is not required to do so.  However,
+    once it drops privileges, it MUST return True.
+    '''
+
+    priority = 0
+
+    # You MUST define enabled=True to make your provisioner discoverable.
+    # An unenabled provisioner may be used directly, but will not be
+    # discovered and used automatically.
+    enabled = False
+
+    def __init__(self):
+        self.name = self.__class__.__name__
+
+    def provision(self, pam):
+        '''this method is called with a PAM context as argument to attempt
+        a provisioning.  It should return True on success and False on failure
+        or if the provisioner is inapplicable.'''
+        return False
+
+    @classmethod
+    def all(cls):
+        '''return a prioritized list of instances of all provisioners'''
+        all = [v() for k, v in globals().items() if type(v) == type(cls) and issubclass(v, cls) and v.enabled]
+        return sorted(all, cmp=lambda a, b: cmp(b.priority, a.priority))
+
+
+class pv_demo(Provisioner):
+    '''demo provisioner'''
+    priority = 10
+    enabled = False
+
+    def provision(self, pam):
+        pam.log('heighho')
+        return False
+
+
+class pv_skel(Provisioner):
+    '''skeleton provisioner (/home/.skel)
+
+    This provisions by copying in a skeleton home directory.  It should
+    therefore be low priority.'''
+
+    priority = -100
+    enabled = True
+    skeleton = '/home/.skel'
+
+    def provision(self, pam):
+        if not os.path.exists(self.skeleton):
+            return False
+
+        pam.copytree(self.skeleton, pam.pw_dir)
+        # pam.copytree() internally chowns
+        return True
+
+
+class pv_etc_skel(pv_skel):
+    '''skeleton provisioner (/etc/skel)
+    /etc/skel is the default skeleton on RHEL5
+
+    This provisions by copying in a skeleton home directory.  It should
+    therefore be low priority.'''
+
+    priority = -110
+    enabled = True
+    skeleton = '/etc/skel'
+
+
+class pv_url(Provisioner):
+    '''url provisioner
+
+    This provisions by downloading a url and attempting to interpret its
+    contents as a file archive containing home directory contents.
+
+    zip is supported.'''
+
+    priority = 10
+    enabled = True
+    urls = (
+        'http://home.uchicago.edu/%s/homedir.bin',
+    )
+    maxlen = 100 * 1024 * 1024   # 100 MB
+
+    methods = (
+        ('zip', zipfile.BadZipfile,
+         lambda fp: zipfile.ZipFile(fp),
+         lambda archive: archive.namelist(),
+         lambda archive: archive.extractall(),
+        ),
+        ('tar', tarfile.ReadError,
+         lambda fp: tarfile.TarFile.open(fileobj=fp),
+         lambda archive: archive.getnames(),
+         lambda archive: archive.extractall(),
+        ),
+    )
+
+    def provision(self, pam):
+        found = False
+        data = None
+        url = ''
+        for url in self.urls:
+            if '%s' in url:
+                url = url % pam.pw_name
+            try:
+                fp = urllib2.urlopen(url)
+            except urllib2.HTTPError:
+                continue
+
+            data = fp.read(self.maxlen)
+            fp.close()
+            if fp.code != 200:
+                # not found; continue searching
+                continue
+
+            # found it
+            found = True
+
+        if not found:
+            return False
+
+        for kind, error, opener, lister, extractor in self.methods:
+            fp = StringIO.StringIO(data)
+            try:
+                pam.log('provisioner %(name)s: trying %(url)s as %(kind)s',
+                        name=self.name, url=url, kind=kind)
+                archive = opener(fp)
+            except error:
+                fp.close()
+                continue
+
+            pam.log('provisioner %(name)s: opened %(url)s as %(kind)s',
+                    name=self.name, url=url, kind=kind)
+            extractor(archive)
+            archive.close()
+            fp.close()
+            pam.chown()
+
+            if os.path.exists('homesetup'):
+                pam.dropprivs()
+                os.system('./homesetup')
+                os.unlink('homesetup')
+
+            return True
+
+        return False
+
+
+def make_directories(username, root_dir, sub_directories=None):
+    # Creates subdirectories
+    # root_directory joined with each sub_directories (array) have to exist,
+    # otherwise the directory with appended username is not created
+    # returns the # of directories created
+    if not os.path.isdir(root_dir):
+        return 0
+    if not sub_directories:
+        sub_directories = ('')
+    created = 0
+    for i in sub_directories:
+        try:
+            # Create directory with mode 0755
+            os.mkdir(os.path.join(root_dir, i, username), 0755)
+            created += 1
+        except OSError:
+            # Ignore "File exist" or unable to create dir
+            pass
+    return created
+
+def main(prog, args):
+    pam = PAM(debug=True)
+
+    # Copy vars from environ
+    for k in 'rhost ruser service tty user type'.split():
+        v = os.environ.get('PAM_' + k.upper(), '')
+        setattr(pam, k, v)
+
+        if k in blacklist and v in blacklist[k]:
+            # ignore silently
+            return 0
+
+    if pam.type == 'close_session':
+        # ignore silently
+        return 0
+
+    if pam.type != 'open_session':
+        # alert - this may be a configuration problem
+        pam.log('refuse to run for pam type %(type)s')
+        return 0
+
+    if pam.user == '':
+        pam.log('pam user unset')
+        return 0
+
+    # Get pw entry for user, or fail
+    p = pwd.getpwnam(pam.user)
+    if p is None:
+        pam.log('cannot look up user %(user)s')
+        return 10
+
+    # Copy pw_* to pam
+    for attr in dir(p):
+        if attr.startswith('pw_'):
+            setattr(pam, attr, getattr(p, attr))
+
+    if pam.pw_uid < 100:
+        pam.log('[%(service)s] refuse to run for pam user %(user)s (uid %(pw_uid)d < 100)')
+        return 0
+
+    # Make the directories in UC3 HDFS
+    dir_created = make_directories(pam.user, '/mnt/hdfs/', ('scratch', 'users'))
+    pam.log('[%(service)s] %(user)s: '+str(dir_created)+' directories created in /mnt/hdfs/')
+
+    # Check whether home dir exists
+    if not os.path.exists(pam.pw_dir):
+        # If not, create it with mode 0751
+        os.mkdir(pam.pw_dir, 0751)
+        os.chown(pam.pw_dir, pam.pw_uid, pam.pw_gid)
+        pam.log('[%(service)s] %(user)s: home directory %(pw_dir)s created')
+
+    if os.listdir(pam.pw_dir):
+        # directory exists and has files in it; no need to populate
+        #pam.log('%(user)s: home directory %(pw_dir)s exists')
+        return 0
+
+    # Directory is empty; try to populate it
+
+    try:
+        os.chdir(pam.pw_dir)
+    except OSError:
+        pam.log('[%(service)s] cannot chdir to %(pw_dir)s')
+        return 20
+
+    for provisioner in Provisioner.all():
+        if pam.debug:
+            pam.log('[%(service)s] trying %(user)s using provisioner "%(provisioner)s"', provisioner=provisioner.__doc__.split('\n')[0])
+        if provisioner.provision(pam):
+            pam.log('[%(service)s] provisioned %(user)s using provisioner "%(provisioner)s"', provisioner=provisioner.__doc__.split('\n')[0])
+            return 0
+
+    pam.log('[%(service)s] could not provision %(user)s using any provisioner')
+    return 255
+
+
+# Run the main() function, exiting with its return value
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[0], sys.argv[1:]))
+
